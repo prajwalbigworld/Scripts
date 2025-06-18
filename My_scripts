@@ -1,0 +1,795 @@
+# ================================
+# option_chain_fetcher.py
+# ================================
+# # engine/option_chain_fetcher.py
+
+import asyncio
+import threading
+import os
+import json
+from datetime import datetime
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+from core.logger import logger
+from core.config import settings
+from engine.option_chain_engine import OptionChainEngine
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+
+class OptionChainFetcher:
+    def __init__(self, symbol, jwt_token, feed_token, client_code, callback=None, max_range_points=400, step=50):
+        self.symbol = symbol.upper()
+        self.jwt_token = jwt_token
+        self.feed_token = feed_token
+        self.client_code = client_code
+        self.callback = callback
+        self.expiry = None
+        self.subscribed_tokens = set()
+        self.token_cache = {}
+        self._running = True
+        self._ws_ready = False
+        self.strike_interval = step
+        self.max_range_points = max_range_points
+        self.option_chain_engine = OptionChainEngine()
+
+        self.sws = SmartWebSocketV2(
+            auth_token=self.jwt_token,
+            api_key=settings.API_KEY,
+            client_code=self.client_code,
+            feed_token=self.feed_token,
+            max_retry_attempt=5,
+            retry_delay=5,
+            retry_duration=60
+        )
+
+        self.sws.on_open = self._on_open
+        self.sws.on_data = self._on_data
+        self.sws.on_close = self._on_close
+        self.sws.on_error = self._on_error
+
+    def _on_open(self, wsapp):
+        logger.info(f"[{self.symbol}] WebSocket connected")
+        self._ws_ready = True
+        if self.expiry:
+            spot = self.option_chain_engine.get_latest_spot() or 0
+            self.update_strike_subscription(spot)
+
+    def _on_data(self, wsapp, message):
+        try:
+            parsed_data = {
+                "token": message.get("token"),
+                "symbol": message.get("symbol"),
+                "strike": message.get("strikePrice"),
+                "type": message.get("optionType"),
+                "expiry": message.get("expiry"),
+                "oi": message.get("openInterest"),
+                "iv": message.get("impliedVolatility"),
+                "ltp": message.get("lastTradedPrice"),
+                "timestamp": message.get("exchangeTimestamp"),
+            }
+
+            self.option_chain_engine.ingest(parsed_data)
+            
+            if self.callback:
+                try:
+                    loop = asyncio.get_running_loop()
+                    if loop.is_running():
+                        loop.create_task(self.callback(parsed_data))
+                except RuntimeError:
+                        # Safe fallback only if no loop is running AND not shutting down
+                    try:
+                        asyncio.run(self.callback(parsed_data))
+                    except asyncio.CancelledError:
+                        logger.warning(f"[{self.symbol}] Callback cancelled during shutdown")
+    
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] Data processing warning: {str(e)}")
+
+    def _on_close(self, wsapp, code, reason, _=None):
+        logger.info(f"[{self.symbol}] WebSocket closed: {code} - {reason}")
+        self._ws_ready = False
+
+    def _on_error(self, wsapp, error):
+        logger.warning(f"[{self.symbol}] WebSocket warning: {str(error)}")
+        self._ws_ready = False
+
+    def calculate_strikes_near_spot(self, spot):
+        count = self.max_range_points // self.strike_interval
+        atm = round(spot / self.strike_interval) * self.strike_interval
+        return [atm + i * self.strike_interval for i in range(-count, count + 1)]
+
+    def update_strike_subscription(self, spot_price):
+        if not self.expiry:
+            return
+            
+        strikes = self.calculate_strikes_near_spot(spot_price)
+        tokens = set(self.get_token_list(strikes, self.expiry))
+
+        if tokens:
+            self.subscribed_tokens = tokens
+            try:
+                self.sws.subscribe("OC", mode=3, token_list=list(tokens))
+            except Exception as e:
+                logger.info(f"[{self.symbol}] Subscription update: {str(e)}")
+
+    def get_token_list(self, strikes, expiry):
+        return [
+            token for strike in strikes
+            for opt_type in ("CE", "PE")
+            if (token := self.resolve_token(self.symbol, strike, opt_type, expiry))
+        ]
+
+    def resolve_token(self, symbol, strike, option_type, expiry):
+        key = (symbol, strike, option_type, expiry)
+        if key in self.token_cache:
+            return self.token_cache[key]
+
+        for item in self.load_scrip_master():
+            if (item.get("symbol") == symbol and
+                item.get("exch_seg") == "NFO" and
+                str(item.get("strike")) == str(strike) and
+                item.get("optiontype") == option_type and
+                item.get("expiry") == expiry):
+                self.token_cache[key] = item.get("token")
+                return self.token_cache[key]
+        return None
+
+    def load_scrip_master(self):
+        try:
+            files = [f for f in os.listdir(DATA_DIR) if f.startswith("scrip_master_")]
+            if files:
+                with open(os.path.join(DATA_DIR, max(files)), "r") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return []
+
+    def get_nearest_expiry(self):
+        today = datetime.now().date()
+        for item in self.load_scrip_master():
+            if item.get("symbol") == self.symbol:
+                try:
+                    exp_date = datetime.strptime(item["expiry"], "%d%b%Y").date()
+                    if exp_date >= today:
+                        return item["expiry"].upper()
+                except ValueError:
+                    continue
+        return None
+
+    async def run_forever(self, callback=None):
+        self.callback = callback  # ✅ Store callback passed from server.py
+        self.expiry = self.get_nearest_expiry()
+        self.start()
+
+        while self._running:
+            await asyncio.sleep(1)
+            if not self._ws_ready:
+                self.start()
+
+    def start(self):
+        try:
+            threading.Thread(target=self.sws.connect, daemon=True).start()
+        except Exception:
+            pass
+
+    async def stop(self):
+        self._running = False
+        try:
+            self.sws.close_connection()
+        except Exception:
+            pass
+
+
+# ================================
+# StrikeFilter.py
+# ================================
+# from core.logger import logger
+
+class StrikeFilter:
+    def __init__(self, top_n=5):
+        self.top_n = top_n
+
+    def filter(self, option_chain):
+        try:
+            valid_entries = [
+                entry for entry in option_chain
+                if isinstance(entry, dict)
+                   and "strikePrice" in entry
+                   and "underlyingValue" in entry
+            ]
+
+            if not valid_entries:
+                logger.warning("[StrikeFilter] No valid entries in option_chain")
+                return []
+
+            underlying = valid_entries[0]["underlyingValue"]
+            strikes = set(entry["strikePrice"] for entry in valid_entries)
+            sorted_strikes = sorted(strikes, key=lambda x: abs(x - underlying))
+            return sorted_strikes[:self.top_n]
+
+        except Exception as e:
+            logger.error(f"[StrikeFilter] Failed to filter strikes: {e}")
+            return []
+
+
+
+# ================================
+# option_chain_engine.py
+# ================================
+# # engine/option_chain_engine.py
+
+import numpy as np
+from collections import defaultdict
+from core.logger import logger
+from core.exceptions import OptionChainProcessingError
+
+class OptionChainEngine:
+    def __init__(self):
+        self.pcr = None
+        self.oi_clusters = {}
+        self.iv_clusters = {}
+        self.latest_snapshot = {}
+        self.latest_spot = 0
+        self.last_ticks = defaultdict(dict)
+
+    def ingest(self, tick: dict):
+        try:
+            # Cache latest spot
+            if tick.get("type") == "XX" and tick.get("ltp"):
+                self.latest_spot = tick["ltp"]
+
+            # Store tick by strike+type
+            key = (tick["strike"], tick["type"])
+            self.last_ticks[key] = tick
+
+            # Optional: trigger downstream processing if needed
+            # self.process_chain(list(self.last_ticks.values()))
+
+        except Exception as e:
+            logger.exception(f"[OptionChainEngine] Ingest failed: {e}")
+            raise OptionChainProcessingError from e
+
+    def process_chain(self, option_chain_data):
+        try:
+            calls, puts = defaultdict(int), defaultdict(int)
+            iv_call, iv_put = defaultdict(list), defaultdict(list)
+            total_call_oi, total_put_oi = 0, 0
+
+            for entry in option_chain_data:
+                strike = entry["strike"]
+                oi = entry.get("oi", 0)
+                iv = entry.get("iv", 0)
+
+                if entry["type"] == "CE":
+                    calls[strike] += oi
+                    iv_call[strike].append(iv)
+                    total_call_oi += oi
+                elif entry["type"] == "PE":
+                    puts[strike] += oi
+                    iv_put[strike].append(iv)
+                    total_put_oi += oi
+
+            self.pcr = round(total_put_oi / total_call_oi, 2) if total_call_oi else 0
+            self.oi_clusters = self._get_clusters(calls, puts)
+            self.iv_clusters = self._get_iv_clusters(iv_call, iv_put)
+
+            self.latest_snapshot = {
+                "pcr": self.pcr,
+                "oi_clusters": self.oi_clusters,
+                "iv_clusters": self.iv_clusters,
+                "latest_spot": self.latest_spot,
+            }
+
+            return self.latest_snapshot
+
+        except Exception as e:
+            logger.error(f"[OptionChainEngine] Error processing option chain: {e}")
+            raise OptionChainProcessingError from e
+
+    def _get_clusters(self, calls, puts):
+        clusters = {
+            "call_max_oi": max(calls.items(), key=lambda x: x[1], default=(None, 0)),
+            "put_max_oi": max(puts.items(), key=lambda x: x[1], default=(None, 0)),
+        }
+        return clusters
+
+    def _get_iv_clusters(self, iv_call, iv_put):
+        avg_iv = lambda ivs: round(np.mean(ivs), 2) if ivs else 0
+        return {
+            "call_avg_iv": {k: avg_iv(v) for k, v in iv_call.items()},
+            "put_avg_iv": {k: avg_iv(v) for k, v in iv_put.items()},
+        }
+
+    def get_latest_spot(self):
+        return self.latest_spot
+
+    def get_snapshot(self):
+        return self.latest_snapshot
+
+    def get_last_tick(self, strike: int, option_type: str):
+        return self.last_ticks.get((strike, option_type))
+
+    def compute_metrics(self, strikes: list) -> dict:
+        try:
+        # Use only the strikes passed in
+            filtered_ticks = [
+                self.last_ticks.get((tick["strike"], tick["type"]))
+                for tick in strikes
+                if (tick.get("strike"), tick.get("type")) in self.last_ticks
+            ]
+
+            filtered_ticks = [t for t in filtered_ticks if t is not None]
+
+            if not filtered_ticks:
+                return {"features": [], "snapshot": {}, "strike_count": 0}
+
+            snapshot = self.process_chain(filtered_ticks)
+
+            # Example features for your AI model — customize as needed
+            features = [
+                snapshot.get("pcr", 0),
+                snapshot.get("latest_spot", 0),
+                snapshot["oi_clusters"].get("call_max_oi", (0, 0))[1],
+                snapshot["oi_clusters"].get("put_max_oi", (0, 0))[1]
+            ]
+
+            return {
+                "features": features,
+                "snapshot": snapshot,
+                "strike_count": len(filtered_ticks)
+            }
+
+        except Exception as e:
+            logger.warning(f"[OptionChainEngine] compute_metrics failed: {e}")
+            return {
+                "features": [],
+                "snapshot": {},
+                "strike_count": 0
+            }
+
+# ================================
+# signal_engine.py
+# ================================
+# # engines/signal_engine.py
+
+from core.logger import logger
+from engine.spoof_detector import SpoofDetector
+from engine.iceberg_detector import IcebergDetector
+from engine.market_regime import MarketRegimeDetector
+from engine.strike_filter import StrikeFilter
+from engine.option_chain_engine import OptionChainEngine
+from engine.orderflow_engine import OrderFlowEngine
+from engine.ai_signal_engine import AISignalEngine
+
+
+class SignalEngine:
+    def __init__(self):
+        self.spoof_detector = SpoofDetector()
+        self.iceberg_detector = IcebergDetector()
+        self.market_regime = MarketRegimeDetector()
+        self.strike_filter = StrikeFilter()
+        self.option_chain_engine = OptionChainEngine()
+        self.orderflow_engine = OrderFlowEngine(window_size=50)
+        self.ai_signal_engine = AISignalEngine()
+
+    def process_tick(self, data):
+        signals = []
+
+        # Step 1: Detect spoofing
+        spoof_signal = self.spoof_detector.detect(data.get("depth"))
+        if spoof_signal:
+            signals.append(spoof_signal)
+
+        # Step 2: Detect iceberg orders
+        iceberg_signal = self.iceberg_detector.detect(data.get("depth"))
+        if iceberg_signal:
+            signals.append(iceberg_signal)
+
+        # Step 3: Detect market regime
+        regime = self.market_regime.evaluate(data.get("index_history", []))
+        if regime:
+            signals.append({"type": "market_regime", "status": regime})
+
+        # Step 4: Filter strikes for relevance
+        filtered_chain = self.strike_filter.filter(data.get("option_chain", []))
+
+        # Step 5: Analyze option chain
+        chain_signals = self.option_chain_engine.compute_metrics(filtered_chain)
+        signals.extend(chain_signals)
+
+        # Step 6: Track orderflow pressure
+        trade_tick = data.get("trade_tick")
+        if trade_tick:
+            self.orderflow_engine.update(trade_tick)
+
+        orderflow_signal = self.orderflow_engine.compute_pressure()
+        if orderflow_signal["status"] in ["bullish", "bearish"]:
+            signals.append({
+                "type": "orderflow",
+                "value": orderflow_signal["imbalance_ratio"],
+                "status": orderflow_signal["status"]
+            })
+
+        # Step 7: Run AI Signal Engine
+        try:
+            ai_signal = self.ai_signal_engine.generate_signal(data)
+            signals.append({
+                "type": "ai_final",
+                "signal": ai_signal.get("final_signal", "HOLD"),
+                "confidence": ai_signal.get("confidence", 0.0),
+                "meta": {
+                    "reason": ai_signal.get("decision_reason", ""),
+                    "market_regime": ai_signal.get("market_regime", ""),
+                    "sentiment_tag": ai_signal.get("sentiment_tag", "")
+                }
+            })
+        except Exception as e:
+            logger.warning(f"⚠️ AI Signal generation skipped due to error: {e}")
+
+        return signals
+
+# ================================
+# ai_signal_engine.py
+# ================================
+# # engines/ai_signal_engine.py
+
+import time
+from typing import Dict, Any
+from core.logger import logger
+from core.config import settings
+from core.exceptions import SignalEngineError
+from models.ai_core import AICore
+from engine.feature_builder import FeatureBuilder
+from engine.option_chain_engine import OptionChainEngine
+from engine.market_regime import MarketRegimeDetector
+from engine.hybrid_signal_resolver import HybridSignalResolver
+from models.predict_lstm import predict_lstm
+
+
+class AISignalEngine:
+    def __init__(self):
+        try:
+            self.model = AICore()
+            self.feature_builder = FeatureBuilder()
+            self.option_chain_engine = OptionChainEngine()
+            self.market_regime = MarketRegimeDetector()
+            self.resolver = HybridSignalResolver()
+            logger.info("✅ AI Signal Engine initialized.")
+        except Exception as e:
+            logger.exception("❌ Failed to initialize AI Signal Engine.")
+            raise SignalEngineError(str(e))
+
+    def _apply_risk_filters(self, chain_metrics: Dict[str, Any]) -> bool:
+        iv = chain_metrics.get("avg_iv", 0)
+        iv_crush_zone = settings.RISK_MAX_IV_CRUSH
+        if iv < iv_crush_zone:
+            logger.warning(f"⚠️ Risk Filter: Low IV detected ({iv}). Skipping signal.")
+            return False
+        return True
+
+    def _tag_sentiment_drift(self, chain_metrics: Dict[str, Any]) -> str:
+        price = chain_metrics.get("price", 0)
+        oi_change = chain_metrics.get("oi_change", 0)
+        drift_tag = ""
+        if oi_change > 0 and price < chain_metrics.get("price_avg", price):
+            drift_tag = "TRAP_ZONE"
+            logger.info("📉 Sentiment Drift Detected: Trap Zone")
+        elif oi_change < 0 and price > chain_metrics.get("price_avg", price):
+            drift_tag = "SHORT_COVERING"
+        return drift_tag
+
+    def generate_signal(self, raw_data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            logger.info("⚙️ Building features for AI signal generation...")
+            features = self.feature_builder.build(raw_data)
+
+            logger.debug("📈 Running option chain metrics...")
+            chain_metrics = self.option_chain_engine.compute(raw_data.get("option_chain", {}))
+            features["chain_data"] = chain_metrics
+
+            if not self._apply_risk_filters(chain_metrics):
+                return {
+                    "final_signal": "HOLD",
+                    "confidence": 0.0,
+                    "decision_reason": "RISK_FILTER_BLOCKED"
+                }
+
+            sentiment_tag = self._tag_sentiment_drift(chain_metrics)
+            regime = self.market_regime.detect(raw_data.get("index_data", {}))
+            features["meta"] = {
+                "market_regime": regime,
+                "sentiment_tag": sentiment_tag,
+            }
+
+            logger.info("🧠 Running AI model prediction...")
+            ai_output = self.model.predict(features)
+
+            ai_output.update({
+                "market_regime": regime,
+                "sentiment_tag": sentiment_tag,
+                "timestamp": time.time()
+            })
+
+            logger.info("📊 Running LSTM model prediction...")
+            lstm_result = {}
+            if "live_df" in raw_data:
+                lstm_result = predict_lstm(raw_data["live_df"])
+            else:
+                logger.warning("⚠️ No 'live_df' found for LSTM. Skipping LSTM prediction.")
+
+            final_signal = self.resolver.resolve(ai_output, lstm_result)
+
+            return final_signal
+
+        except Exception as e:
+            logger.exception("❌ Signal generation failed.")
+            raise SignalEngineError(str(e))
+
+# ================================
+# rule_signal_engine.py
+# ================================
+# # backend/engine/rule_signal_engine.py
+
+import logging
+from typing import Dict, Any, List, Callable
+from core.logger import logger
+from core.config import settings
+from core.exceptions import SignalEngineError
+
+class RuleSignalEngine:
+    def __init__(self):
+        logger.info("Rule Signal Engine initialized.")
+        self.rules: List[Callable] = []
+        self._register_default_rules()
+
+    def register_rule(self, rule_func: Callable) -> None:
+        """Register a new rule function to be evaluated."""
+        self.rules.append(rule_func)
+
+    def evaluate(self, option_data: Dict[str, Any], market_context: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        """
+        Applies all registered rules to the given option_data and market context.
+        Returns a list of signals generated.
+        """
+        if market_context is None:
+            market_context = {}
+            
+        signals = []
+        for rule in self.rules:
+            try:
+                result = rule(option_data, market_context)
+                if result:
+                    signals.append(result)
+            except Exception as e:
+                logger.error(f"Rule evaluation failed: {e}")
+        return signals
+
+    def evaluate_conditions(self, indicators: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Original evaluation method maintained for backward compatibility.
+        """
+        try:
+            # Convert indicators to option_data format for compatibility
+            option_data = {
+                "pcr": indicators.get("pcr"),
+                "iv_change": 20 if indicators.get("iv_spike", False) else 0,
+                "timestamp": indicators.get("timestamp")
+            }
+            
+            market_context = {
+                "vwap_trend": indicators.get("vwap_trend", "neutral"),
+                "ema_cross": indicators.get("ema_cross"),
+                "market_regime": indicators.get("market_regime", "UNKNOWN"),
+                "order_flow_anomalies": {
+                    "spoofing": indicators.get("spoofing_detected", False),
+                    "iceberg": indicators.get("iceberg_detected", False)
+                }
+            }
+            
+            signals = self.evaluate(option_data, market_context)
+            
+            # Convert signals to the original format
+            signal = "HOLD"
+            confidence = 0.0
+            reasons = []
+            
+            for sig in signals:
+                if sig["type"] == "bearish_signal":
+                    signal = "SELL"
+                    confidence += 0.3
+                    reasons.append(sig["reason"])
+                elif sig["type"] == "bullish_signal":
+                    signal = "BUY"
+                    confidence += 0.3
+                    reasons.append(sig["reason"])
+                elif sig["type"] == "volatility_spike":
+                    confidence += 0.2
+                    reasons.append(sig["reason"])
+            
+            # Additional logic from original implementation
+            vwap_trend = market_context.get("vwap_trend")
+            if vwap_trend == "up":
+                confidence += 0.2
+                signal = "BUY"
+                reasons.append("VWAP_UP")
+            elif vwap_trend == "down":
+                confidence += 0.2
+                signal = "SELL"
+                reasons.append("VWAP_DOWN")
+                
+            ema_cross = market_context.get("ema_cross")
+            if ema_cross == "golden":
+                signal = "BUY"
+                confidence += 0.3
+                reasons.append("EMA_GOLDEN")
+            elif ema_cross == "death":
+                signal = "SELL"
+                confidence += 0.3
+                reasons.append("EMA_DEATH")
+                
+            if market_context.get("market_regime") == "CHOPPY":
+                signal = "HOLD"
+                confidence = 0.0
+                reasons.append("REGIME_CHOPPY")
+
+            return {
+                "signal": signal,
+                "confidence": min(confidence, 1.0),
+                "reasons": reasons,
+                "timestamp": indicators.get("timestamp")
+            }
+
+        except Exception as e:
+            logger.exception("Rule Signal Evaluation Failed.")
+            raise SignalEngineError(str(e))
+
+    def _register_default_rules(self) -> None:
+        """Register default rules that come with the engine."""
+        self.register_rule(self._rule_pcr_extreme)
+        self.register_rule(self._rule_iv_spike)
+        self.register_rule(self._rule_order_flow_anomalies)
+
+    @staticmethod
+    def _rule_pcr_extreme(option_data: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        pcr = option_data.get("pcr")
+        if pcr is None:
+            return None
+        if pcr > settings.PCR_HIGH_THRESHOLD:
+            return {"type": "bearish_signal", "reason": "PCR_HIGH"}
+        elif pcr < settings.PCR_LOW_THRESHOLD:
+            return {"type": "bullish_signal", "reason": "PCR_LOW"}
+        return None
+
+    @staticmethod
+    def _rule_iv_spike(option_data: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        iv_change = option_data.get("iv_change")
+        if iv_change is not None and iv_change > settings.IV_SPIKE_THRESHOLD:
+            return {"type": "volatility_spike", "reason": f"IV_SPIKE"}
+        return None
+
+    @staticmethod
+    def _rule_order_flow_anomalies(option_data: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        anomalies = context.get("order_flow_anomalies", {})
+        if anomalies.get("spoofing", False) or anomalies.get("iceberg", False):
+            return {"type": "order_flow_anomaly", "reason": "ORDER_FLOW_ANOMALY"}
+        return None
+
+
+# ================================
+# market_regime.py
+# ================================
+# # engines/market_regime.py
+
+import numpy as np
+from core.logger import logger
+
+class MarketRegimeDetector:
+    def __init__(self, atr_period=14):
+        self.atr_period = atr_period
+
+    def detect(self, ohlcv):
+        try:
+            highs = np.array([bar["high"] for bar in ohlcv])
+            lows = np.array([bar["low"] for bar in ohlcv])
+            closes = np.array([bar["close"] for bar in ohlcv])
+
+            tr = np.maximum(highs[1:] - lows[1:], 
+                            np.abs(highs[1:] - closes[:-1]), 
+                            np.abs(lows[1:] - closes[:-1]))
+            atr = np.mean(tr[-self.atr_period:])
+
+            recent_range = np.abs(closes[-1] - closes[-self.atr_period])
+            if recent_range > 1.5 * atr:
+                return "trending"
+            else:
+                return "choppy"
+        except Exception as e:
+            logger.error(f"[MarketRegimeDetector] Error: {e}")
+            return "unknown"
+
+# ================================
+# live_data_feed.py
+# ================================
+# I don't have live_data_feed.py
+
+
+# ================================
+# option_signal_worker.py
+# ================================
+# # backend/engine/option_signal_worker.py
+
+import asyncio
+import json
+from fastapi import WebSocket
+from core.logger import logger
+from engine.signal_engine import SignalEngine
+
+class OptionSignalWorker:
+    def __init__(self):
+        self.signal_engine = SignalEngine()
+        self.clients = set()
+        self.running = True
+
+    async def register_client(self, websocket: WebSocket):
+        await websocket.accept()
+        self.clients.add(websocket)
+        logger.info(f"[OptionSignalWorker] Client connected. Total: {len(self.clients)}")
+
+    async def unregister_client(self, websocket: WebSocket):
+        if websocket in self.clients:
+            self.clients.remove(websocket)
+            logger.info(f"[OptionSignalWorker] Client disconnected. Remaining: {len(self.clients)}")
+
+    async def stream_signals(self, market_data):
+        try:
+            signals = self.signal_engine.process_tick(market_data)
+            message = json.dumps({
+                "type": "market_signal",
+                "data": signals
+            })
+
+            disconnected = []
+            for client in self.clients:
+                try:
+                    await client.send_text(message)
+                except Exception as e:
+                    logger.warning(f"[OptionSignalWorker] Error sending signal to client: {e}")
+                    disconnected.append(client)
+
+            for d in disconnected:
+                self.clients.discard(d)
+
+        except Exception as e:
+            logger.error(f"[OptionSignalWorker] Signal streaming failed: {e}")
+
+    async def run_forever(self, signal_engine=None, signal_clients=None):
+        """Continuously runs and can send test heartbeat or future logic."""
+        logger.info("[OptionSignalWorker] Running background loop...")
+        while self.running:
+            try:
+                await self.broadcast_heartbeat()
+                await asyncio.sleep(5)
+            except Exception as e:
+                logger.exception(f"[OptionSignalWorker] Error in loop: {e}")
+                await asyncio.sleep(10)
+
+    async def broadcast_heartbeat(self):
+        """Send periodic heartbeat or status updates to clients."""
+        message = json.dumps({
+            "type": "heartbeat",
+            "msg": "OptionSignalWorker is alive."
+        })
+
+        disconnected = []
+        for client in list(self.clients):
+            try:
+                await client.send_text(message)
+            except Exception as e:
+                logger.warning(f"[OptionSignalWorker] Failed to send heartbeat: {e}")
+                disconnected.append(client)
+
+        for ws in disconnected:
+            self.clients.discard(ws)
+
+    async def shutdown(self):
+        self.running = False
+        logger.info("[OptionSignalWorker] Shutdown complete.")
