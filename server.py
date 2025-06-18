@@ -1,5 +1,4 @@
-server.py
-
+server
 # backend/server.py
 
 import os
