@@ -1,4 +1,3 @@
-server
 # backend/server.py
 
 import os
@@ -64,12 +63,22 @@ from models.model_configs import (
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-# Logging
+# Remove all handlers from all loggers
+loggers = [logging.getLogger()] + [
+    logging.getLogger(name) for name in logging.root.manager.loggerDict
+]
+for logger in loggers:
+    logger.handlers.clear()
+    logger.propagate = False
+
+# Reconfigure clean logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
 logger = logging.getLogger(__name__)
+logger.info("✅ Clean logging initialized")
 
 load_dotenv()
 
@@ -291,6 +300,8 @@ class ConnectionManager:
         self.pending_subscriptions: List = []
         self.lock = threading.Lock()
 
+        self.last_pong_time = time.time()
+
     async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
         with self.lock:
@@ -320,7 +331,6 @@ class ConnectionManager:
             except Exception:
                 self.live_clients.discard(ws)
 
-
     def subscribe_token(self, token: str, exchangeType: int):
         token_key = f"{exchangeType}|{token}"
         if token_key in self.subscribed_tokens:
@@ -343,7 +353,7 @@ class ConnectionManager:
         try:
             self.angel_ws.subscribe(
                 correlation_id=f"sub_{token}",
-                mode=3,  # LTP + Market Depth
+                mode=3,
                 token_list=[{
                     "exchangeType": exchangeType,
                     "tokens": [token]
@@ -356,6 +366,21 @@ class ConnectionManager:
             logger.info(f"[Subscribed] Token: {token_key}")
         except Exception as e:
             logger.error(f"[Subscription Failed] Token: {token_key} → {e}")
+
+    def subscribe_token_group(self, exchange_type: int, token_list: list):
+        try:
+            token_group = {
+                "exchangeType": exchange_type,
+                "tokens": token_list
+            }
+            self.angel_ws.subscribe(
+                correlation_id=f"sub_{exchange_type}_{int(time.time())}",
+                mode=3,
+                token_list=[token_group]
+            )
+            logger.info(f"[Subscribed Group] {token_group}")
+        except Exception as e:
+            logger.error(f"[Group Subscribe Error] {e}")
 
     def exchange_type_to_str(self, exchangeType: int) -> str:
         exchange_map = {
@@ -424,22 +449,26 @@ class ConnectionManager:
             except Exception as e:
                 logger.error(f"[on_data error] {e}")
 
-
         def on_error(wsapp, error):
             logger.error(f"[WebSocket Error] {error}")
             self.ws_ready = False
             asyncio.run_coroutine_threadsafe(self.reconnect_angel_ws(), self.loop)
 
-        def on_close(wsapp):
-            logger.warning("[WebSocket Closed]")
+        def on_close(wsapp, code=None, reason=None, _=None):
+            logger.warning(f"[WebSocket Closed] code={code}, reason={reason}")
             self.ws_ready = False
             if not self.shutdown_flag:
                 asyncio.run_coroutine_threadsafe(self.reconnect_angel_ws(), self.loop)
+
+        def on_pong(wsapp, message):
+            self.last_pong_time = time.time()
+            logger.debug(f"[PONG] {message}")
 
         self.angel_ws.on_open = on_open
         self.angel_ws.on_data = on_data
         self.angel_ws.on_error = on_error
         self.angel_ws.on_close = on_close
+        self.angel_ws.on_pong = on_pong
 
         self.ws_thread = threading.Thread(target=self.angel_ws.connect, daemon=True)
         self.ws_thread.start()
@@ -452,9 +481,8 @@ class ConnectionManager:
             self.angel_ws.close_connection()
         except Exception:
             pass
-        await asyncio.sleep(3)
+        await asyncio.sleep(15)
         self.start_angel_websocket()
-
 
 #part 3
 
@@ -511,14 +539,32 @@ async def lifespan(app: FastAPI):
     session_data = manager.session_data["data"]
     smart_api = manager.smart_api
 
-    # --- Option Chain Fetcher ---
-    symbol = os.getenv("DEFAULT_SYMBOL", "NIFTY")
-    option_chain_fetcher = OptionChainFetcher(
-    jwt_token=session_data["jwtToken"],
-    feed_token=smart_api.getfeedToken(),
-    client_code=os.getenv("CLIENT_CODE"),
-    symbol=symbol
-    )
+    # --- Dynamic Option Chain Fetcher Setup ---
+    app.state.option_chain_fetchers = {}
+
+    try:
+        from engine.option_chain_manager import OptionChainManager
+        scrip_master = OptionChainManager.load_scrip_master()
+        all_symbols = OptionChainManager.get_all_symbols()
+
+        for symbol in all_symbols:
+            try:
+                expiry = OptionChainManager.get_nearest_expiry(symbol, scrip_master)
+                fetcher = OptionChainFetcher(
+                    jwt_token=session_data["jwtToken"],
+                    feed_token=smart_api.getfeedToken(),
+                    client_code=os.getenv("CLIENT_CODE"),
+                    symbol=symbol,
+                    expiry=expiry,
+                    manager=manager
+                )
+                app.state.option_chain_fetchers[symbol] = fetcher
+                asyncio.create_task(fetcher.run_forever(callback=handle_option_chain_tick))
+                logger.info(f"✅ OptionChainFetcher ready for {symbol} [{expiry}]")
+            except Exception as e:
+                logger.warning(f"[Skip] OptionChainFetcher init failed for {symbol}: {e}")
+    except Exception as e:
+        logger.error(f"[Option Chain Init Failed] {e}")
 
     # --- App State Sharing ---
     app.state.manager = manager
@@ -533,7 +579,6 @@ async def lifespan(app: FastAPI):
     app.state.strike_filter = strike_filter
     app.state.global_feed_engine = global_feed_engine
     app.state.option_signal_worker = option_signal_worker
-    app.state.option_chain_fetcher = option_chain_fetcher
     app.state.ai_model_server = ai_model_server
     app.state.ai_model_validator = ai_model_validator
 
@@ -543,11 +588,6 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("WebSocket initialization failed")
 
     # --- Start background tasks ---
-    if option_chain_fetcher:
-        asyncio.create_task(
-            option_chain_fetcher.run_forever(callback=handle_option_chain_tick)
-        )
-
     if option_signal_worker:
         asyncio.create_task(
             option_signal_worker.run_forever(signal_engine, manager.signal_clients)
@@ -576,7 +616,134 @@ async def lifespan(app: FastAPI):
     if manager.ws_thread and manager.ws_thread.is_alive():
         manager.ws_thread.join(timeout=3)
 
-    await option_chain_fetcher.stop()
+    # Stop all dynamic fetchers
+    for fetcher in app.state.option_chain_fetchers.values():
+        await fetcher.stop()
+
+    await option_signal_worker.shutdown()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("🚀 Starting FastAPI lifespan setup")
+
+    # Start Prometheus metrics
+    start_http_server(9000)
+
+    # --- Init Manager & Core Engines ---
+    manager = ConnectionManager()
+    signal_engine = SignalEngine()
+    rule_engine = RuleSignalEngine()
+    option_engine = OptionChainEngine()
+    hybrid_engine = HybridSignalEngine(option_engine, rule_engine)
+    orderflow_engine = OrderFlowEngine(window_size=60)
+    regime_detector = MarketRegimeDetector()
+    spoof_detector = SpoofDetector()
+    iceberg_detector = IcebergDetector()
+    strike_filter = StrikeFilter()
+    global_feed_engine = GlobalFeedEngine()
+    option_signal_worker = OptionSignalWorker()
+
+    # --- Init AI model server ---
+    try:
+        ai_model_server = AIModelServer(model_type=AIModelType.LSTM)
+    except Exception as e:
+        logger.error(f"[AI Model Server Init Error] {e}")
+        ai_model_server = None
+
+    # --- Init AI model validator ---
+    try:
+        ai_model_validator = AIModelValidator(model_type=AIModelType.LSTM)
+    except Exception as e:
+        logger.error(f"[Model Validator Error] {e}")
+        ai_model_validator = None
+
+    # --- SmartAPI Auth + Session Init ---
+    if not manager.initialize_smart_api():
+        raise RuntimeError("❌ SmartAPI login failed")
+
+    session_data = manager.session_data["data"]
+    smart_api = manager.smart_api
+
+    # --- Dynamic Option Chain Fetcher Setup ---
+    app.state.option_chain_fetchers = {}
+
+    try:
+        from engine.option_chain_manager import OptionChainManager
+        scrip_master = OptionChainManager.load_scrip_master()
+        all_symbols = OptionChainManager.get_all_symbols()
+
+        for symbol in all_symbols:
+            try:
+                expiry = OptionChainManager.get_nearest_expiry(symbol, scrip_master)
+                fetcher = OptionChainFetcher(
+                    jwt_token=session_data["jwtToken"],
+                    feed_token=smart_api.getfeedToken(),
+                    client_code=os.getenv("CLIENT_CODE"),
+                    symbol=symbol,
+                    expiry=expiry,
+                    manager=manager
+                )
+                app.state.option_chain_fetchers[symbol] = fetcher
+                asyncio.create_task(fetcher.run_forever(callback=handle_option_chain_tick))
+                logger.info(f"✅ OptionChainFetcher ready for {symbol} [{expiry}]")
+            except Exception as e:
+                logger.warning(f"[Skip] OptionChainFetcher init failed for {symbol}: {e}")
+    except Exception as e:
+        logger.error(f"[Option Chain Init Failed] {e}")
+
+    # --- App State Sharing ---
+    app.state.manager = manager
+    app.state.signal_engine = signal_engine
+    app.state.rule_engine = rule_engine
+    app.state.option_engine = option_engine
+    app.state.hybrid_engine = hybrid_engine
+    app.state.orderflow_engine = orderflow_engine
+    app.state.market_regime_detector = regime_detector
+    app.state.spoof_detector = spoof_detector
+    app.state.iceberg_detector = iceberg_detector
+    app.state.strike_filter = strike_filter
+    app.state.global_feed_engine = global_feed_engine
+    app.state.option_signal_worker = option_signal_worker
+    app.state.ai_model_server = ai_model_server
+    app.state.ai_model_validator = ai_model_validator
+
+    # --- Start WebSocket Feed ---
+    if not manager.start_angel_websocket():
+        logger.error("❌ WebSocket start failed")
+        raise RuntimeError("WebSocket initialization failed")
+
+    # --- Start background tasks ---
+    if option_signal_worker:
+        asyncio.create_task(
+            option_signal_worker.run_forever(signal_engine, manager.signal_clients)
+        )
+
+    app.state.healthy = all([
+        manager.ws_ready,
+        signal_engine.is_ready(),
+        ai_model_server is not None,
+        ai_model_validator is not None
+    ])
+
+    logger.info("✅ Lifespan startup complete")
+    yield  # === APP STARTS HERE ===
+
+    # === Shutdown Sequence ===
+    logger.info("🛑 Lifespan shutdown initiated")
+    manager.shutdown_flag = True
+
+    if manager.angel_ws:
+        try:
+            manager.angel_ws.close_connection()
+        except:
+            pass
+
+    if manager.ws_thread and manager.ws_thread.is_alive():
+        manager.ws_thread.join(timeout=3)
+
+    # Stop all dynamic fetchers
+    for fetcher in app.state.option_chain_fetchers.values():
+        await fetcher.stop()
+
     await option_signal_worker.shutdown()
 
 app.router.lifespan_context = lifespan
@@ -597,6 +764,23 @@ async def get_metrics():
         content=generate_latest(registry=metrics.registry),
         media_type="text/plain"
     )
+
+@app.get("/option-chain")
+async def get_option_chain(symbol: str):
+    """
+    Optional live snapshot endpoint for Option Chain viewer
+    """
+    try:
+        fetcher = app.state.option_chain_fetchers.get(symbol)
+        if not fetcher:
+            return {"error": f"Symbol {symbol} not found in option_chain_fetchers"}
+
+        snapshot = fetcher.option_chain_engine.get_snapshot()
+        return {"symbol": symbol, "snapshot": snapshot}
+
+    except Exception as e:
+        logger.error(f"[Option Chain API] Error: {e}")
+        return {"error": str(e)}
 
 @app.post("/predict")
 async def predict(payload: dict):
@@ -620,21 +804,21 @@ async def validate(payload: dict):
 async def websocket_live(websocket: WebSocket):
     client_id = f"client_{len(app.state.manager.active_connections) + 1}"
     await app.state.manager.connect(websocket, client_id)
+
     try:
         while True:
-            data = await websocket.receive_text()
             try:
-                msg = json.loads(data)
-                if msg.get("type") == "ping":
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+
+                if data == "ping":
                     await websocket.send_text("pong")
-                elif msg.get("type") == "subscribe":
-                    tokens = msg.get("tokens", [])
-                    exch = msg.get("exchangeType", 2)
-                    for token in tokens:
-                        app.state.manager.subscribe_token(token, exch)
-                    await websocket.send_json({"status": "subscribed", "tokens": tokens})
-            except Exception as e:
-                await websocket.send_json({"error": str(e)})
+                else:
+                    await websocket.send_json({"msg": "unknown command"})
+
+            except asyncio.TimeoutError:
+                # Instead of closing — send heartbeat, keep open
+                await websocket.send_json({"type": "keepalive", "timestamp": time.time()})
+
     except WebSocketDisconnect:
         await app.state.manager.disconnect(client_id)
 
@@ -653,7 +837,10 @@ async def handle_option_chain_tick(chain_data: Dict):
     spoof_flags = app.state.spoof_detector.detect(chain_data)
     iceberg_flags = app.state.iceberg_detector.detect(chain_data)
     option_metrics = app.state.option_engine.compute_metrics(top_strikes)
-    regime = app.state.market_regime_detector.detect()
+    ohlcv_data = chain_data.get("ohlcv", [])
+    if not ohlcv_data:
+        logger.warning("⚠️ No OHLCV data passed to MarketRegimeDetector")
+    regime = app.state.market_regime_detector.detect(ohlcv_data)
 
     app.state.signal_engine.update_context({
         "regime": regime,
@@ -694,3 +881,4 @@ if __name__ == "__main__":
         ws_ping_timeout=30,
         log_level="info"
     )
+
