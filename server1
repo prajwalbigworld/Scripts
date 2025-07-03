@@ -1,0 +1,1009 @@
+# backend/server.py
+# 🔹 Core Python
+import os
+import io
+import sys
+import json
+import time
+import asyncio
+import logging
+import threading
+import numpy as np
+import pandas as pd
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Dict, List, Set, Optional
+
+# 🔹 FastAPI & Starlette
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Response, Request
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.websockets import WebSocketState
+from contextlib import asynccontextmanager
+
+# 🔹 External Dependencies
+from dotenv import load_dotenv
+from circuitbreaker import circuit
+from prometheus_client import generate_latest, start_http_server
+import requests
+import pyotp
+
+# 🔹 SmartAPI SDK (AngelOne)
+from SmartApi.smartConnect import SmartConnect
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+
+# 🔹 Utils & Handlers
+from utils.handlers import handle_option_chain_tick
+from utils.option_chain_token_resolver import resolve_nearest_expiry
+from utils.historical_data import HistoricalDataFetcher
+
+# 🔹 Engine Core Modules
+from engine.option_chain_engine import OptionChainEngine
+from engine.option_chain_fetcher import OptionChainFetcher
+from engine.option_chain_manager import OptionChainManager
+from engine.option_signal_worker import OptionSignalWorker
+from engine.rule_signal_engine import RuleSignalEngine
+from engine.hybrid_signal_engine import HybridSignalEngine
+from engine.orderflow_engine import OrderFlowEngine
+from engine.market_regime import MarketRegimeDetector
+from engine.spoof_detector import SpoofDetector
+from engine.iceberg_detector import IcebergDetector
+from engine.strike_filter import StrikeFilter
+from engine.global_feed_engine import GlobalFeedEngine
+from engine.strike_filter_adapter import convert_engine_ticks_to_strikefilter_input
+#from engine.connection_manager import ConnectionManager  # Make sure this exists
+
+# 🔹 AI & Model Components
+from models.ai_model_server import AIModelServer
+from models.ai_model_validator import AIModelValidator
+from models.model_types import AIModelType, TradeAction
+from models.model_configs import LSTMModelConfig, BayesianFilterConfig, RLAgentConfig
+from models.lstm_model import LSTMModel
+from models.reinforcement_agent import RLAgentConfig
+from models.ai_core import (
+    LSTMPriceDirectionModel,
+    BayesianNoiseFilter,
+    ReinforcementAgent,
+    ModelRegistry,
+    ModelInferenceError,
+)
+
+# 🔹 Metrics
+from core.metrics import metrics
+
+# Fix encoding
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+# Remove all handlers from all loggers
+loggers = [logging.getLogger()] + [
+    logging.getLogger(name) for name in logging.root.manager.loggerDict
+]
+for logger in loggers:
+    logger.handlers.clear()
+    logger.propagate = False
+
+# Reconfigure clean logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+logger = logging.getLogger(__name__)
+logger.info("✅ Clean logging initialized")
+
+load_dotenv()
+
+# Scrip master
+SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+SCRIP_MASTER_CACHE = None
+SCRIP_MASTER_LAST_UPDATED = None
+
+# === SIGNAL ENGINE ===
+
+@dataclass
+class SignalOutput:
+    direction: str  # BUY/SELL/NEUTRAL
+    confidence: float
+    rl_action: str  # EXECUTE/DELAY/CANCEL
+    filtered_signal: bool
+    features: Dict[str, float]
+
+class SignalEngine:
+    def __init__(self):
+        self.models = self._initialize_models()
+        self.feature_history = []
+        self._lock = threading.Lock()
+        self._ready = False
+        self.orderflow_signals = []
+        self.ai_predictions = []
+        self.context = {}
+        try:
+            self._warmup()
+        except Exception as e:
+            logger.error(f"SignalEngine initialization failed: {str(e)}")
+            self._ready = False
+            raise
+
+    def _initialize_models(self) -> ModelRegistry:
+        """Initialize all AI models with proper configuration"""
+        registry = ModelRegistry()
+        
+        lstm_config = LSTMModelConfig(
+            input_size=5,
+            hidden_size=128,
+            num_layers=2,
+            output_size=3,
+            dropout=0.2,
+            model_path="models/lstm_direction.h5",
+            sequence_length=60,
+            num_features=4,
+            min_confidence=0.65
+        )
+        lstm = LSTMPriceDirectionModel(lstm_config)
+        
+        bayes_config = BayesianFilterConfig(
+            prior_prob=0.5,
+            likelihood_true=0.8,
+            likelihood_false=0.2
+        )
+        bayes_filter = BayesianNoiseFilter(bayes_config)
+        
+        rl_config = RLAgentConfig(
+            state_size=3,
+            action_size=len(TradeAction),
+            max_position_size=1000.0
+        )
+        rl_agent = ReinforcementAgent(rl_config)
+        
+        registry.register("lstm", lstm)
+        registry.register("bayes_filter", bayes_filter)
+        registry.register("rl_agent", rl_agent)
+        
+        return registry
+
+    def _warmup(self):
+        """Initialize models with production data"""
+        try:
+            empty_data = {
+                "call_oi": 1.0, 
+                "put_oi": 1.0,
+                "call_iv": 0.1, 
+                "put_iv": 0.1,
+                "call_vol": 1.0, 
+                "put_vol": 1.0,
+                "price_change": 0.0, 
+                "time_delta": 1.0,
+                "processing_latency": 0.0
+            }
+            self.process_market_data(empty_data)
+            self._ready = True
+            logger.info("SignalEngine initialized successfully")
+        except Exception as e:
+            logger.error(f"SignalEngine warmup failed: {str(e)}")
+            self._ready = False
+            raise
+
+    @circuit(failure_threshold=3, recovery_timeout=60)
+    @metrics.get_metric("model_inference_latency").labels(model_type="lstm").time()
+    def process_market_data(self, raw_data: Dict) -> Optional[SignalOutput]:
+        """Main processing pipeline with circuit breaker"""
+        metrics.get_metric('engine_requests').labels(engine_type='signal').inc()
+        
+        try:
+            features = self._extract_features(raw_data)
+
+            with self._lock:
+                self.feature_history.append(features)
+                if len(self.feature_history) > 1000:
+                    self.feature_history.pop(0)
+
+            lstm = self.models.get("lstm")
+            lstm_probs, confidence = lstm.predict(np.array([list(features.values())]))
+
+            bayes_filter = self.models.get("bayes_filter")
+            filtered, filtered_prob = bayes_filter.update(confidence)
+
+            rl_state = self._create_rl_state(features, lstm_probs)
+            rl_agent = self.models.get("rl_agent")
+            action, _ = rl_agent.decide_action(confidence, rl_state)
+
+            return SignalOutput(
+                direction=self._get_direction(lstm_probs),
+                confidence=confidence,
+                rl_action=action,
+                filtered_signal=filtered,
+                features=features
+            )
+        except Exception as e:
+            logger.error(f"Signal processing failed: {str(e)}", exc_info=True)
+            metrics.get_metric('signal_processing_errors').inc()
+            raise ModelInferenceError(f"Signal processing failed: {str(e)}") from e
+
+    def _extract_features(self, data: Dict) -> Dict[str, float]:
+        """Convert raw market data into model features with numeric values"""
+        def to_float(value):
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                return 0.0
+
+        return {
+            "oi_imbalance": to_float(data.get("call_oi", 1)) / (to_float(data.get("put_oi", 1)) + 1e-6),
+            "iv_spread": to_float(data.get("call_iv", 0)) - to_float(data.get("put_iv", 0)),
+            "volume_ratio": to_float(data.get("call_vol", 1)) / (to_float(data.get("put_vol", 1)) + 1e-6),
+            "price_velocity": to_float(data.get("price_change", 0)) / (to_float(data.get("time_delta", 1)) + 1e-6),
+            "processing_latency": to_float(data.get("processing_latency", 0))
+        }
+
+    def _create_rl_state(self, features: Dict, lstm_output: np.ndarray) -> np.ndarray:
+        """Prepare state representation for RL agent as numpy array"""
+        def safe_float(value):
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                return 0.0
+
+        return np.array([
+            safe_float(max(lstm_output)),  # signal_strength
+            safe_float(features.get("iv_spread", 0)),  # volatility
+            safe_float(features.get("processing_latency", 0))  # latency
+        ], dtype=np.float32)
+
+    def _get_direction(self, probabilities: np.ndarray) -> str:
+        """Convert probability array to direction"""
+        classes = ["BUY", "SELL", "NEUTRAL"]
+        return classes[np.argmax(probabilities)]
+
+    def update_context(self, context_data: Dict):
+        """Update engine context with market regime and other data"""
+        with self._lock:
+            self.context.update(context_data)
+
+    def push_orderflow_signal(self, signal: Dict):
+        """Store orderflow signals for processing"""
+        with self._lock:
+            self.orderflow_signals.append(signal)
+            if len(self.orderflow_signals) > 100:
+                self.orderflow_signals.pop(0)
+
+    def push_ai_prediction(self, prediction: Dict):
+        """Store AI predictions for processing"""
+        with self._lock:
+            self.ai_predictions.append(prediction)
+            if len(self.ai_predictions) > 100:
+                self.ai_predictions.pop(0)
+
+    def is_ready(self) -> bool:
+        return self._ready
+
+    def get_metrics(self) -> Dict:
+        """Get metrics from all models"""
+        metrics_data = {
+            "requests": metrics.get_metric('engine_requests').labels(engine_type='signal')._value.get(),
+            "processing_time": metrics.get_metric('signal_processing_time')._sum.get()
+        }
+
+        try:
+            model_metrics = self.models.get_model_metrics()
+            metrics_data.update(model_metrics)
+        except Exception as e:
+            logger.warning(f"Failed to get model metrics: {str(e)}")
+
+        return metrics_data
+
+#part 2
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+        self.live_clients: Set[WebSocket] = set()
+        self.signal_clients: Set[WebSocket] = set()
+
+        self.smart_api: Optional[SmartConnect] = None
+        self.session_data = None
+        self.angel_ws: Optional[SmartWebSocketV2] = None
+        self.ws_thread: Optional[threading.Thread] = None
+        self.ws_ready = False
+        self.loop = asyncio.get_event_loop_policy().get_event_loop()
+        self.shutdown_flag = False
+
+        self.subscribed_tokens: Dict[str, Dict] = {}
+        self.pending_subscriptions: List = []
+        self.lock = threading.Lock()
+        self.last_pong_time = time.time()
+
+    async def connect(self, websocket: WebSocket, client_id: str):
+        await websocket.accept()
+        with self.lock:
+            self.active_connections[client_id] = websocket
+        logger.info(f"[Client Connected] {client_id}")
+
+    async def disconnect(self, client_id: str):
+        with self.lock:
+            if client_id in self.active_connections:
+                del self.active_connections[client_id]
+                logger.info(f"[Client Disconnected] {client_id}")
+
+    async def connect_live_client(self, websocket: WebSocket):
+        await websocket.accept()
+        with self.lock:
+            self.live_clients.add(websocket)
+        logger.info(f"[Live WS Client Connected] Total: {len(self.live_clients)}")
+
+    async def broadcast_to_live(self, message: dict):
+        for ws in list(self.live_clients):
+            try:
+                if ws.client_state == WebSocketState.CONNECTED:
+                    await ws.send_json(message)
+                else:
+                    self.live_clients.discard(ws)
+            except:
+                self.live_clients.discard(ws)
+
+    def subscribe_token(self, token: str, exchangeType: int):
+        token_key = f"{exchangeType}|{token}"
+        if token_key in self.subscribed_tokens:
+            return
+
+        if not self.ws_ready:
+            self.pending_subscriptions.append((token, exchangeType))
+            return
+
+        if SCRIP_MASTER_CACHE:
+            valid = any(
+                str(item["token"]) == str(token)
+                and item["exch_seg"] == self.exchange_type_to_str(exchangeType)
+                for item in SCRIP_MASTER_CACHE
+            )
+            if not valid:
+                logger.warning(f"[Invalid Token] {token_key}")
+                return
+
+        try:
+            self.angel_ws.subscribe(
+                correlation_id=f"sub_{token}",
+                mode=3,
+                token_list=[{
+                    "exchangeType": exchangeType,
+                    "tokens": [token]
+                }]
+            )
+            self.subscribed_tokens[token_key] = {
+                "exchangeType": exchangeType,
+                "token": token
+            }
+            logger.info(f"[Subscribed] Token: {token_key}")
+        except Exception as e:
+            logger.error(f"[Subscription Failed] Token: {token_key} → {e}")
+
+    def subscribe_token_group(self, exchange_type: int, token_list: list):
+        if not self.ws_ready:
+            for t in token_list:
+                self.pending_subscriptions.append((t, exchange_type))
+            logger.warning("[Subscription Deferred] WebSocket not ready.")
+            return
+
+        try:
+            payload = [{
+                "exchangeType": exchange_type,
+                "tokens": token_list
+            }]
+            self.angel_ws.subscribe(
+                correlation_id=f"grp_{exchange_type}_{int(time.time())}",
+                mode=3,
+                token_list=payload
+            )
+            for t in token_list:
+                token_key = f"{exchange_type}|{t}"
+                self.subscribed_tokens[token_key] = {
+                    "exchangeType": exchange_type,
+                    "token": t
+                }
+            logger.info(f"[Subscribed Group] {payload}")
+        except Exception as e:
+            logger.error(f"[Group Subscribe Error] {e}")
+
+    def exchange_type_to_str(self, exchangeType: int) -> str:
+        exchange_map = {
+            1: "NSE", 2: "NFO", 3: "BSE", 4: "BFO",
+            5: "MCX", 7: "CDS", 13: "NCDEX"
+        }
+        return exchange_map.get(exchangeType, "NSE")
+
+    def initialize_smart_api(self) -> bool:
+        try:
+            self.smart_api = SmartConnect(api_key=os.getenv("API_KEY"))
+            totp = pyotp.TOTP(os.getenv("TOTP_SECRET")).now()
+            self.session_data = self.smart_api.generateSession(
+                clientCode=os.getenv("CLIENT_CODE"),
+                password=os.getenv("mpin"),
+                totp=totp
+            )
+            if not self.session_data["status"]:
+                logger.error(f"[Login Failed] {self.session_data['message']}")
+                return False
+
+            logger.info("✅ SmartAPI Authentication Successful")
+            return True
+        except Exception as e:
+            logger.error(f"[SmartAPI Init Error] {e}")
+            return False
+
+    def start_angel_websocket(self) -> bool:
+        if self.ws_thread and self.ws_thread.is_alive():
+            try:
+                self.angel_ws.close_connection()
+                self.ws_thread.join()
+            except Exception:
+                pass
+
+        if not self.initialize_smart_api():
+            return False
+
+        jwt = self.session_data["data"]["jwtToken"]
+        feed_token = self.smart_api.getfeedToken()
+
+        self.angel_ws = SmartWebSocketV2(
+            auth_token=jwt,
+            api_key=os.getenv("API_KEY"),
+            client_code=os.getenv("CLIENT_CODE"),
+            feed_token=feed_token,
+            max_retry_attempt=5,
+            retry_delay=3,
+            retry_duration=60
+        )
+
+        def on_open(wsapp):
+            logger.info("📡 AngelOne WebSocket Opened")
+            self.ws_ready = True
+            for token, exch in self.pending_subscriptions:
+                self.subscribe_token(token, exch)
+            self.pending_subscriptions.clear()
+
+        def on_data(wsapp, message):
+            try:
+                logger.info(f"[TICK] {message}")
+                parsed = message if isinstance(message, dict) else json.loads(message)
+                asyncio.run_coroutine_threadsafe(self.broadcast_to_live(parsed), self.loop)
+            except Exception as e:
+                logger.error(f"[on_data error] {e}")
+
+        def on_error(wsapp, error):
+            logger.error(f"[WebSocket Error] {error}")
+            self.ws_ready = False
+            asyncio.run_coroutine_threadsafe(self.reconnect_angel_ws(), self.loop)
+
+        def on_close(wsapp, code=None, reason=None, _=None):
+            logger.warning(f"[WebSocket Closed] code={code}, reason={reason}")
+            self.ws_ready = False
+            if not self.shutdown_flag:
+                asyncio.run_coroutine_threadsafe(self.reconnect_angel_ws(), self.loop)
+
+        def on_pong(wsapp, message):
+            self.last_pong_time = time.time()
+            logger.debug(f"[PONG] {message}")
+
+        self.angel_ws.on_open = on_open
+        self.angel_ws.on_data = on_data
+        self.angel_ws.on_error = on_error
+        self.angel_ws.on_close = on_close
+        self.angel_ws.on_pong = on_pong
+
+        self.ws_thread = threading.Thread(target=self.angel_ws.connect, daemon=True)
+        self.ws_thread.start()
+        return True
+
+    async def reconnect_angel_ws(self):
+        logger.info("🔁 Reconnecting WebSocket...")
+        self.ws_ready = False
+        try:
+            self.angel_ws.close_connection()
+        except Exception:
+            pass
+        await asyncio.sleep(15)
+        self.start_angel_websocket()
+
+#part 3
+
+app = FastAPI(title="F&O AI Trading Engine")
+
+# Allow all origins
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("🚀 Starting FastAPI lifespan setup")
+
+    # Start Prometheus metrics
+    start_http_server(9000)
+
+    # --- Init Core Engines ---
+    manager = ConnectionManager()
+    signal_engine = SignalEngine()
+    rule_engine = RuleSignalEngine()
+    option_engine = OptionChainEngine()
+    hybrid_engine = HybridSignalEngine(option_engine, rule_engine)
+    orderflow_engine = OrderFlowEngine(window_size=60)
+    regime_detector = MarketRegimeDetector()
+    spoof_detector = SpoofDetector()
+    iceberg_detector = IcebergDetector()
+    strike_filter = StrikeFilter()
+    global_feed_engine = GlobalFeedEngine()
+    option_signal_worker = OptionSignalWorker()
+
+    # --- AI Model Setup ---
+    try:
+        ai_model_server = AIModelServer(model_type=AIModelType.LSTM)
+    except Exception as e:
+        logger.error(f"[AI Model Server Init Error] {e}")
+        ai_model_server = None
+
+    try:
+        ai_model_validator = AIModelValidator(model_type=AIModelType.LSTM)
+    except Exception as e:
+        logger.error(f"[Model Validator Error] {e}")
+        ai_model_validator = None
+
+    # --- SmartAPI Login ---
+    if not manager.initialize_smart_api():
+        raise RuntimeError("❌ SmartAPI login failed")
+    
+    session_data = manager.session_data["data"]
+    smart_api = manager.smart_api
+
+    # --- Share App State ---
+    app.state.manager = manager
+    app.state.signal_engine = signal_engine
+    app.state.rule_engine = rule_engine
+    app.state.option_engine = option_engine
+    app.state.hybrid_engine = hybrid_engine
+    app.state.orderflow_engine = orderflow_engine
+    app.state.market_regime_detector = regime_detector
+    app.state.spoof_detector = spoof_detector
+    app.state.iceberg_detector = iceberg_detector
+    app.state.strike_filter = strike_filter
+    app.state.global_feed_engine = global_feed_engine
+    app.state.option_signal_worker = option_signal_worker
+    app.state.ai_model_server = ai_model_server
+    app.state.ai_model_validator = ai_model_validator
+    app.state.option_chain_fetchers = {}
+
+    # --- Start Default NIFTY Chain ---
+    try:
+        default_symbol = "NIFTY"
+        expiry = resolve_nearest_expiry(default_symbol)
+        if expiry:
+            fetcher = OptionChainFetcher(
+                symbol=default_symbol,
+                jwt_token=session_data["jwtToken"],
+                feed_token=smart_api.getfeedToken(),
+                client_code=os.getenv("CLIENT_CODE"),
+            )
+            fetcher.expiry = expiry
+            app.state.option_chain_fetchers[default_symbol] = fetcher
+            asyncio.create_task(fetcher.run_forever(callback=handle_option_chain_tick))
+            logger.info(f"✅ Default OptionChainFetcher ready for {default_symbol} [{expiry}]")
+        else:
+            logger.warning("⚠️ Could not resolve expiry for NIFTY at startup")
+    except Exception as e:
+        logger.error(f"[Startup Fetcher Error] {e}")
+
+    # --- WebSocket Start ---
+    if not manager.start_angel_websocket():
+        raise RuntimeError("WebSocket startup failed")
+
+    # --- Background Workers ---
+    if option_signal_worker:
+        asyncio.create_task(option_signal_worker.run_forever())
+
+    app.state.healthy = all([
+        manager.ws_ready,
+        signal_engine.is_ready(),
+        ai_model_server is not None,
+        ai_model_validator is not None
+    ])
+
+    logger.info("✅ Lifespan startup complete")
+    yield  # === APP RUNS ===
+
+    # --- Shutdown Logic ---
+    logger.info("🛑 Lifespan shutdown initiated")
+    manager.shutdown_flag = True
+
+    if manager.angel_ws:
+        try:
+            manager.angel_ws.close_connection()
+        except:
+            pass
+
+    if manager.ws_thread and manager.ws_thread.is_alive():
+        manager.ws_thread.join(timeout=3)
+
+    for fetcher in app.state.option_chain_fetchers.values():
+        stop_fn = getattr(fetcher, "stop", None)
+        if callable(stop_fn):
+            result = stop_fn()
+            if asyncio.iscoroutine(result):
+                await result
+            else:
+                logger.warning(f"⚠️ Fetcher stop() is not async: {type(fetcher)}")
+        else:
+            logger.warning(f"⚠️ Fetcher has no stop() method: {type(fetcher)}")
+
+    await option_signal_worker.shutdown()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("🚀 Starting FastAPI lifespan setup")
+
+    # Start Prometheus metrics
+    start_http_server(9000)
+
+    # --- Init Core Engines ---
+    manager = ConnectionManager()
+    signal_engine = SignalEngine()
+    rule_engine = RuleSignalEngine()
+    option_engine = OptionChainEngine()
+    hybrid_engine = HybridSignalEngine(option_engine, rule_engine)
+    orderflow_engine = OrderFlowEngine(window_size=60)
+    regime_detector = MarketRegimeDetector()
+    spoof_detector = SpoofDetector()
+    iceberg_detector = IcebergDetector()
+    strike_filter = StrikeFilter()
+    global_feed_engine = GlobalFeedEngine()
+    option_signal_worker = OptionSignalWorker()
+
+    # --- AI Model Setup ---
+    try:
+        ai_model_server = AIModelServer(model_type=AIModelType.LSTM)
+    except Exception as e:
+        logger.error(f"[AI Model Server Init Error] {e}")
+        ai_model_server = None
+
+    try:
+        ai_model_validator = AIModelValidator(model_type=AIModelType.LSTM)
+    except Exception as e:
+        logger.error(f"[Model Validator Error] {e}")
+        ai_model_validator = None
+
+    # --- SmartAPI Login ---
+    if not manager.initialize_smart_api():
+        raise RuntimeError("❌ SmartAPI login failed")
+    
+    session_data = manager.session_data["data"]
+    smart_api = manager.smart_api
+
+    # --- Share App State ---
+    app.state.manager = manager
+    app.state.signal_engine = signal_engine
+    app.state.rule_engine = rule_engine
+    app.state.option_engine = option_engine
+    app.state.hybrid_engine = hybrid_engine
+    app.state.orderflow_engine = orderflow_engine
+    app.state.market_regime_detector = regime_detector
+    app.state.spoof_detector = spoof_detector
+    app.state.iceberg_detector = iceberg_detector
+    app.state.strike_filter = strike_filter
+    app.state.global_feed_engine = global_feed_engine
+    app.state.option_signal_worker = option_signal_worker
+    app.state.ai_model_server = ai_model_server
+    app.state.ai_model_validator = ai_model_validator
+    app.state.option_chain_fetchers = {}
+
+    # --- Start Default NIFTY Chain ---
+    try:
+        default_symbol = "NIFTY"
+        expiry = resolve_nearest_expiry(default_symbol)
+        if expiry:
+            fetcher = OptionChainFetcher(
+                symbol=default_symbol,
+                jwt_token=session_data["jwtToken"],
+                feed_token=smart_api.getfeedToken(),
+                client_code=os.getenv("CLIENT_CODE"),
+            )
+            fetcher.expiry = expiry
+            app.state.option_chain_fetchers[default_symbol] = fetcher
+            asyncio.create_task(fetcher.run_forever(callback=handle_option_chain_tick))
+            logger.info(f"✅ Default OptionChainFetcher ready for {default_symbol} [{expiry}]")
+        else:
+            logger.warning("⚠️ Could not resolve expiry for NIFTY at startup")
+    except Exception as e:
+        logger.error(f"[Startup Fetcher Error] {e}")
+
+    # --- WebSocket Start ---
+    if not manager.start_angel_websocket():
+        raise RuntimeError("WebSocket startup failed")
+
+    # --- Background Workers ---
+    if option_signal_worker:
+        asyncio.create_task(option_signal_worker.run_forever())
+
+    app.state.healthy = all([
+        manager.ws_ready,
+        signal_engine.is_ready(),
+        ai_model_server is not None,
+        ai_model_validator is not None
+    ])
+
+    logger.info("✅ Lifespan startup complete")
+    yield  # === APP RUNS ===
+
+    # --- Shutdown Logic ---
+    logger.info("🛑 Lifespan shutdown initiated")
+    manager.shutdown_flag = True
+
+    if manager.angel_ws:
+        try:
+            manager.angel_ws.close_connection()
+        except:
+            pass
+
+    if manager.ws_thread and manager.ws_thread.is_alive():
+        manager.ws_thread.join(timeout=3)
+
+    for fetcher in app.state.option_chain_fetchers.values():
+        await fetcher.stop()
+
+    await option_signal_worker.shutdown()
+
+app.router.lifespan_context = lifespan
+
+#part 4
+
+@app.get("/health")
+async def health_check():
+    return {
+        "websocket_connected": app.state.manager.ws_ready,
+        "signal_engine_ready": app.state.signal_engine.is_ready(),
+        "healthy": app.state.healthy
+    }
+
+@app.get("/metrics")
+async def get_metrics():
+    return Response(
+        content=generate_latest(registry=metrics.registry),
+        media_type="text/plain"
+    )
+
+@app.get("/option-chain")
+async def start_option_chain(symbol: str, request: Request):
+    symbol = symbol.upper()
+
+    if symbol in request.app.state.option_chain_fetchers:
+        return {"status": "already_running", "symbol": symbol}
+
+    try:
+        scrip_data = OptionChainManager.load_scrip_master()
+        expiry = OptionChainManager.get_nearest_expiry(symbol, scrip_data)
+
+        fetcher = OptionChainFetcher(
+            symbol=symbol,
+            jwt_token=request.app.state.manager.session_data["data"]["jwtToken"],
+            feed_token=request.app.state.manager.smart_api.getfeedToken(),
+            client_code=os.getenv("CLIENT_CODE"),
+        )
+        fetcher.expiry = expiry  # set expiry separately
+
+        request.app.state.option_chain_fetchers[symbol] = fetcher
+        asyncio.create_task(fetcher.run_forever(callback=handle_option_chain_tick))
+        logger.info(f"✅ OptionChainFetcher launched for {symbol} [{expiry}]")
+        return {"status": "launched", "symbol": symbol, "expiry": expiry}
+
+    except Exception as e:
+        logger.error(f"[Dynamic Launch Error] {symbol}: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/predict")
+async def predict(payload: dict):
+    try:
+        prediction = app.state.ai_model_server.predict(payload["features"])
+        return {"prediction": prediction}
+    except Exception as e:
+        logger.error(f"Prediction error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/validate")
+async def validate(payload: dict):
+    try:
+        result = app.state.ai_model_validator.evaluate(payload["X"], payload["y"])
+        return result
+    except Exception as e:
+        logger.error(f"Validation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.websocket("/ws/live")
+async def websocket_live(websocket: WebSocket):
+    client_id = f"client_{len(app.state.manager.active_connections) + 1}"
+    await app.state.manager.connect(websocket, client_id)
+
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+
+                if msg == "ping":
+                    await websocket.send_text("pong")
+                    continue
+
+                try:
+                    data = json.loads(msg)
+                except json.JSONDecodeError:
+                    await websocket.send_json({"type": "error", "message": "Invalid JSON"})
+                    continue
+
+                # ✅ Handle symbol search from frontend
+                if data.get("type") == "search":
+                    symbol = data.get("symbol", "").upper()
+                    if not symbol:
+                        await websocket.send_json({"type": "error", "message": "Symbol missing"})
+                        continue
+
+                    if symbol in app.state.option_chain_fetchers:
+                        await websocket.send_json({"type": "status", "message": f"{symbol} already active"})
+                        continue
+
+                    try:
+                        scrip_data = OptionChainManager.load_scrip_master()
+                        expiry = OptionChainManager.get_nearest_expiry(symbol, scrip_data)
+
+                        fetcher = OptionChainFetcher(
+                            symbol=symbol,
+                            jwt_token=app.state.manager.session_data["data"]["jwtToken"],
+                            feed_token=app.state.manager.smart_api.getfeedToken(),
+                            client_code=os.getenv("CLIENT_CODE"),
+                            expiry=expiry
+                        )
+                        app.state.option_chain_fetchers[symbol] = fetcher
+                        asyncio.create_task(fetcher.run_forever(callback=handle_option_chain_tick))
+
+                        await websocket.send_json({
+                            "type": "status",
+                            "message": f"Fetcher started for {symbol} [{expiry}]"
+                        })
+
+                    except Exception as e:
+                        logger.error(f"[WS Symbol Search Error] {symbol}: {e}")
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": f"Failed to start fetcher for {symbol}: {str(e)}"
+                        })
+
+                else:
+                    await websocket.send_json({"type": "info", "message": "Unknown command"})
+
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "keepalive", "timestamp": time.time()})
+
+    except WebSocketDisconnect:
+        await app.state.manager.disconnect(client_id)
+
+@app.websocket("/ws/signals")
+async def websocket_signals(websocket: WebSocket):
+    await app.state.manager.connect_live_client(websocket)
+    try:
+        while websocket.client_state == WebSocketState.CONNECTED:
+            await asyncio.sleep(1)
+    except WebSocketDisconnect:
+        app.state.manager.live_clients.discard(websocket)
+
+# Global tick buffer for all symbols
+
+tick_buffer = defaultdict(list)
+
+async def handle_option_chain_tick(chain_data: Dict):
+    manager = app.state.manager
+    option_engine = app.state.option_engine
+    spot_price = option_engine.get_latest_spot()
+
+    raw_symbol = chain_data.get("symbol", "NIFTY")
+    strike = str(int(chain_data.get("strike", 0)))
+    symbol = raw_symbol.split(strike)[0].rstrip("CEPE")
+
+    # Buffer the tick
+    tick_buffer[symbol].append(chain_data)
+
+    fetcher = app.state.option_chain_fetchers.get(symbol)
+    expected_tokens = set(getattr(fetcher, "tokens", [])) if fetcher else set()
+    current_buffer = tick_buffer[symbol]
+
+    received_tokens = {tick.get("token") for tick in current_buffer if tick.get("token") in expected_tokens}
+    if len(received_tokens) < len(expected_tokens):
+        return
+
+    # ✅ Filter and flush tick buffer
+    ticks = [tick for tick in current_buffer if tick.get("token") in received_tokens]
+    tick_buffer[symbol] = []
+
+    # ✅ Ingest into the actual engine (let it handle filtering)
+    for tick in ticks:
+        option_engine.ingest(tick)
+        logger.debug(f"[{symbol}] ✅ After ingesting tick: {tick.get('symbol')} → filtered_strikes: {option_engine.filtered_strikes}")
+
+    # 🕵️ DEBUG: Before accessing filtered_strikes
+    logger.warning(f"[{symbol}] DEBUG filtered_strikes BEFORE access: {option_engine.filtered_strikes}")
+
+    # ⚙️ Read pre-computed filtered strikes (fallback to regenerate if missing)
+    filtered = option_engine.filtered_strikes
+
+    if not filtered or not filtered.get("CE") or not filtered.get("PE"):
+        logger.warning(f"[{symbol}] 🔁 filtered_strikes empty, regenerating from StrikeFilter...")
+        spot_price = option_engine.get_latest_spot()
+        adapted = convert_engine_ticks_to_strikefilter_input(ticks, spot_price)
+        filtered = app.state.strike_filter.filter(adapted)
+        option_engine.filtered_strikes = filtered  # 🔁 Update it back
+
+    # 🕵️ DEBUG: After assigning filtered
+    logger.warning(f"[{symbol}] DEBUG filtered_strikes AFTER access: {filtered}")
+
+    top_strikes = {
+        "CE": filtered.get("CE", []),
+        "PE": filtered.get("PE", []),
+        "ATM": filtered.get("ATM", 0)
+    }
+
+    logger.info(f"[{symbol}] Top strikes received: {top_strikes['CE'] + top_strikes['PE']}")
+    logger.info(f"[{symbol}] Adapted strike prices: {top_strikes['CE'] + top_strikes['PE']}")
+
+    if not top_strikes["CE"] and not top_strikes["PE"]:
+        logger.warning(f"[{symbol}] ⚠️ No valid strike matches for OptionEngine")
+
+    option_metrics = option_engine.compute_metrics(top_strikes["CE"] + top_strikes["PE"])
+    
+    # 📊 Market regime detection
+    ohlcv_data = chain_data.get("ohlcv", [])
+    if ohlcv_data and isinstance(ohlcv_data, list) and len(ohlcv_data) >= 1:
+        regime = app.state.market_regime_detector.detect(ohlcv_data)
+    else:
+        logger.info(f"[{symbol}] No OHLCV available — using neutral regime")
+        regime = {"trend": "neutral", "volatility": "normal"}
+
+    app.state.signal_engine.update_context({
+        "regime": regime,
+        "option_metrics": option_metrics,
+        "spoof_flags": [],  
+        "iceberg_flags": []  
+    })
+
+    ai_features = option_metrics.get("features", [])
+    if not ai_features or len(ai_features) != 5:
+        logger.warning(f"[{symbol}] ⚠️ AI features incomplete: {ai_features} — using fallback vector")
+        ai_features = [0, 0, 0, 0, 0]
+
+    prediction = app.state.ai_model_server.predict(ai_features)
+
+    trade_tick = chain_data.get("trade_tick")
+    if trade_tick:
+        app.state.orderflow_engine.update(trade_tick)
+        signal = app.state.orderflow_engine.compute_pressure()
+        if signal.get("status") in ["bullish", "bearish"]:
+            app.state.signal_engine.push_orderflow_signal(signal)
+
+    app.state.signal_engine.push_ai_prediction(prediction)
+
+    live_data = {
+        "strikes": top_strikes,
+        "prediction": prediction,
+        "regime": regime,
+        "spoof": [],  # Replace if using detectors
+        "iceberg": []
+    }
+    await manager.broadcast_to_live(live_data)
+
+if __name__ == "__main__":
+    print("🚀 Launching F&O AI Trading Backend...")
+    uvicorn.run(
+        "backend.server:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=False,
+        ws_ping_interval=15,
+        ws_ping_timeout=30,
+        log_level="info"
+    )
